@@ -47,4 +47,40 @@ app.post('/api/maintenance/windows',async(req:any,res)=>{const b=req.body as any
 app.post('/api/maintenance/:id/execute',async(req:any,res)=>{const w=maintenanceWindows.find(x=>x.id===(req.params as any).id);if(!w)return res.code(404).send({error:'maintenance window not found'});if(!w.checks.sparesReady)return res.code(409).send({error:'spares readiness check failed'});if(w.requiredLockout&&!(req.body as any)?.lockoutConfirmed)return res.code(409).send({error:'lockout confirmation required'});const a=assets.find(x=>x.id===w.assetId);if(a)a.state='stopped';w.status='executing';w.executedAt=now();log('maintenance.execute',w.id,w);return w;});
 app.get('/api/process/health-score',async()=>{const degraded=assets.filter(a=>a.state!=='running').length;const high=anomalies.filter(a=>a.status!=='resolved'&&a.severity==='high').length;const stale=telemetry.filter(t=>Date.now()-Date.parse(t.time)>15*60*1000).length;return{score:Number(Math.max(0,100-degraded*18-high*25-stale*2).toFixed(1)),components:{assetAvailability:assets.length?1-degraded/assets.length:1,criticalAnomalies:high,dataFreshness:telemetry.length?1-stale/telemetry.length:1},at:now()};});
 
+// Replay sessions: frozen retrospectives over a creation-time snapshot. Execution is read-only —
+// live telemetry, anomalies and the causal graph are never mutated, and re-running a terminal
+// session returns the stored outcome unchanged (stable results).
+type ReplaySession={id:string;assetId:string;window:{from:string;to:string};rootNodeId:string;status:'pending'|'completed'|'invalid';createdAt:string;executedAt?:string;failure?:{code:string;message:string};snapshot:{takenAt:string;asset:Asset|null;telemetry:Telemetry[];anomalies:Anomaly[];causalEdges:typeof causalEdges};result:any};
+const replaySessions:ReplaySession[]=[];
+const clone=<T>(x:T):T=>structuredClone(x);
+function limitCheck(lim:{min:number;max:number},value:number){const span=lim.max-lim.min;const distance=value<lim.min?lim.min-value:value>lim.max?value-lim.max:0;const score=distance>0?Math.min(1,.45+distance/(span||1)):0;return{distance,score,severity:score>.8?'high':score>.6?'medium':'low'};}
+app.post('/api/replay/sessions',async(req:any,res)=>{const b=req.body as any;if(!b.assetId||!b.from||!b.to||!b.rootNodeId)return res.code(400).send({error:'assetId、from、to、rootNodeId 必填'});const fromMs=Date.parse(b.from),toMs=Date.parse(b.to);const inWindow=(t:string)=>{const x=Date.parse(t);return!Number.isNaN(x)&&!Number.isNaN(fromMs)&&!Number.isNaN(toMs)&&x>=fromMs&&x<=toMs;};const s:ReplaySession={id:randomUUID(),assetId:String(b.assetId),window:{from:String(b.from),to:String(b.to)},rootNodeId:String(b.rootNodeId),status:'pending',createdAt:now(),snapshot:{takenAt:now(),asset:clone(assets.find(a=>a.id===b.assetId)||null),telemetry:clone(telemetry.filter(t=>t.assetId===b.assetId&&inWindow(t.time))),anomalies:clone(anomalies.filter(a=>a.assetId===b.assetId&&inWindow(a.time))),causalEdges:clone(causalEdges)},result:null};replaySessions.push(s);log('replay-session.create',s.id,{assetId:s.assetId,window:s.window,rootNodeId:s.rootNodeId});return s;});
+app.post('/api/replay/sessions/:id/run',async(req:any,res)=>{
+ const s=replaySessions.find(x=>x.id===(req.params as any).id);if(!s)return res.code(404).send({error:'replay session not found'});
+ if(s.status!=='pending')return s;
+ const fail=(code:string,message:string)=>{s.status='invalid';s.failure={code,message};s.executedAt=now();log('replay-session.invalid',s.id,s.failure);return s;};
+ const asset=s.snapshot.asset;if(!asset)return fail('unknown-asset',`资产 ${s.assetId} 在创建快照时不存在`);
+ const fromMs=Date.parse(s.window.from),toMs=Date.parse(s.window.to);
+ if(Number.isNaN(fromMs)||Number.isNaN(toMs))return fail('invalid-time-window',`时间窗无法解析（from=${s.window.from}, to=${s.window.to}）`);
+ if(fromMs>toMs)return fail('invalid-time-window',`时间窗起点晚于终点（from=${s.window.from}, to=${s.window.to}）`);
+ const inputs=[...s.snapshot.telemetry].sort((a,b)=>Date.parse(a.time)-Date.parse(b.time));
+ if(!inputs.length)return fail('empty-window','时间窗内没有该资产的遥测数据');
+ const graphNodes=new Set(s.snapshot.causalEdges.flatMap(e=>[e.from,e.to]));
+ if(!graphNodes.has(s.rootNodeId))return fail('unknown-root-node',`根节点 ${s.rootNodeId} 不在因果图中`);
+ const constraintResults:any[]=[],deviceStates:any[]=[];
+ for(const t of inputs){let violations=0,worst:'none'|'low'|'medium'|'high'='none';
+  for(const [variable,value] of Object.entries(t.values)){const lim=asset.limits[variable];if(!lim)continue;const{distance,score,severity}=limitCheck(lim,value);
+   constraintResults.push({time:t.time,assetId:t.assetId,variable,value,limit:{min:lim.min,max:lim.max},violated:distance>0,distance:Number(distance.toFixed(4)),score:Number(score.toFixed(4)),severity:distance>0?severity:'none'});
+   if(distance>0){violations++;if(severity==='high')worst='high';else if(severity==='medium'&&worst!=='high')worst='medium';else if(worst==='none')worst='low';}}
+  deviceStates.push({time:t.time,assetId:asset.id,state:worst==='high'?'degraded':asset.state,violations});}
+ const reachable=new Set<string>([s.rootNodeId]);for(let changed=true;changed;){changed=false;for(const e of s.snapshot.causalEdges)if(reachable.has(e.from)&&!reachable.has(e.to)){reachable.add(e.to);changed=true;}}
+ const edges=s.snapshot.causalEdges.filter(e=>reachable.has(e.from)&&reachable.has(e.to));
+ const supportingAnomalies=s.snapshot.anomalies.filter(a=>a.causes.some(c=>reachable.has(c))).sort((a,b)=>Date.parse(a.time)-Date.parse(b.time)||a.id.localeCompare(b.id));
+ s.result={inputs,deviceStates,constraintResults,causalEvidence:{rootNodeId:s.rootNodeId,nodes:[...reachable].sort(),edges,supportingAnomalies},summary:{inputCount:inputs.length,violationCount:constraintResults.filter(c=>c.violated).length,deviceStateChanges:deviceStates.filter(d=>d.state!==asset.state).length,window:{...s.window}}};
+ s.status='completed';s.executedAt=now();log('replay-session.run',s.id,{inputs:inputs.length,violations:s.result.summary.violationCount});return s;
+});
+app.get('/api/replay/sessions',async(req:any)=>{const q=req.query as any;return replaySessions.filter(s=>(!q.assetId||s.assetId===q.assetId)&&(!q.status||s.status===q.status)).map(s=>({id:s.id,assetId:s.assetId,window:s.window,rootNodeId:s.rootNodeId,status:s.status,failure:s.failure??null,createdAt:s.createdAt,executedAt:s.executedAt??null}));});
+app.get('/api/replay/sessions/:id',async(req:any,res)=>{const s=replaySessions.find(x=>x.id===(req.params as any).id);if(!s)return res.code(404).send({error:'replay session not found'});return s;});
+app.get('/api/replay/sessions/:id/result',async(req:any,res)=>{const s=replaySessions.find(x=>x.id===(req.params as any).id);if(!s)return res.code(404).send({error:'replay session not found'});if(s.status==='pending')return res.code(409).send({error:'会话尚未执行，请先 POST /api/replay/sessions/:id/run',status:s.status});if(s.status==='invalid')return res.code(409).send({error:'会话无效终止',status:s.status,failure:s.failure});return s.result;});
+
 app.listen({port:Number(process.env.PORT||6301),host:'127.0.0.1'}).catch(err=>{app.log.error(err);process.exit(1)});

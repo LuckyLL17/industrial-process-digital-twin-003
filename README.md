@@ -28,3 +28,13 @@ npm run dev
 - 综合过程健康评分
 
 扩展接口：`/api/recipes`、`/api/control/commands`、`/api/maintenance/windows`、`/api/process/health-score`。
+
+## 复盘会话（Replay Session）
+
+面向已结束生产时段的独立回放，与实时链路完全隔离：
+
+- `POST /api/replay/sessions`：按 `assetId`、`from`/`to` 时间窗、`rootNodeId` 创建会话，创建即冻结快照（资产、窗口内遥测/异常、因果边深拷贝），之后写入的实时数据不会混入
+- `POST /api/replay/sessions/:id/run`：执行回放，产出按时间排序的输入快照、设备状态、约束结果与因果证据；只读计算，不修改实时 telemetry、anomaly、causal graph；终态会话重复执行返回同一结果
+- `GET /api/replay/sessions`（支持 `assetId`、`status` 过滤）、`GET /api/replay/sessions/:id`、`GET /api/replay/sessions/:id/result`
+
+会话状态：`pending`（未执行）→ `completed`（成功）或 `invalid`（无效终止，附可解释原因：空窗口 `empty-window`、坏时间戳 `invalid-time-window`、无效根节点 `unknown-root-node`、未知资产 `unknown-asset`）。
