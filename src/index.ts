@@ -1,9 +1,7 @@
 import Fastify from 'fastify';
 import { randomUUID } from 'node:crypto';
-
-type Telemetry = { time:string; assetId:string; values:Record<string,number>; quality:'good'|'suspect'|'bad' };
-type Asset = { id:string; name:string; type:string; parentId?:string; limits:Record<string,{min:number;max:number}>; state:'running'|'degraded'|'stopped'; last:Record<string,number> };
-type Anomaly = { id:string; time:string; assetId:string; variable:string; value:number; score:number; severity:'low'|'medium'|'high'; status:'open'|'investigating'|'resolved'; causes:string[] };
+import type { Telemetry, Asset, Anomaly, CausalEdge } from './types.js';
+import { registerReplayRoutes } from './replay.js';
 const app=Fastify({logger:true});
 const now=()=>new Date().toISOString();
 const assets:Asset[]=[
@@ -12,7 +10,7 @@ const assets:Asset[]=[
  {id:'heater-01',name:'预热器 H-01',type:'heater',parentId:'reactor-01',limits:{temperature:{min:120,max:180},power:{min:20,max:90}},state:'running',last:{temperature:145,power:54}}
 ];
 const telemetry:Telemetry[]=[]; const anomalies:Anomaly[]=[]; const investigations:any[]=[]; const scenarios:any[]=[]; const workOrders:any[]=[]; const audit:any[]=[];
-const causalEdges=[
+const causalEdges:CausalEdge[]=[
  {from:'pump-01',to:'reactor-01',relation:'feeds'}, {from:'heater-01',to:'reactor-01',relation:'conditions'},
  {from:'low-flow',to:'temperature-drift',relation:'causes',weight:.71}, {from:'high-vibration',to:'low-flow',relation:'causes',weight:.64},
  {from:'valve-stiction',to:'low-flow',relation:'causes',weight:.52}
@@ -46,5 +44,8 @@ app.post('/api/control/commands',async(req:any,res)=>{const b=req.body as any;if
 app.post('/api/maintenance/windows',async(req:any,res)=>{const b=req.body as any;if(!b.assetId||!b.start||!b.end)return res.code(400).send({error:'assetId、start、end 必填'});const window={id:randomUUID(),assetId:b.assetId,start:b.start,end:b.end,requiredLockout:Boolean(b.requiredLockout??true),checks:{downstreamImpact:Boolean(b.downstreamImpact),sparesReady:Boolean(b.sparesReady)},status:'planned'};maintenanceWindows.push(window);return window;});
 app.post('/api/maintenance/:id/execute',async(req:any,res)=>{const w=maintenanceWindows.find(x=>x.id===(req.params as any).id);if(!w)return res.code(404).send({error:'maintenance window not found'});if(!w.checks.sparesReady)return res.code(409).send({error:'spares readiness check failed'});if(w.requiredLockout&&!(req.body as any)?.lockoutConfirmed)return res.code(409).send({error:'lockout confirmation required'});const a=assets.find(x=>x.id===w.assetId);if(a)a.state='stopped';w.status='executing';w.executedAt=now();log('maintenance.execute',w.id,w);return w;});
 app.get('/api/process/health-score',async()=>{const degraded=assets.filter(a=>a.state!=='running').length;const high=anomalies.filter(a=>a.status!=='resolved'&&a.severity==='high').length;const stale=telemetry.filter(t=>Date.now()-Date.parse(t.time)>15*60*1000).length;return{score:Number(Math.max(0,100-degraded*18-high*25-stale*2).toFixed(1)),components:{assetAvailability:assets.length?1-degraded/assets.length:1,criticalAnomalies:high,dataFreshness:telemetry.length?1-stale/telemetry.length:1},at:now()};});
+
+// Replay sessions: frozen-snapshot, time-windowed, root-causal review of past production windows.
+registerReplayRoutes(app,{assets,telemetry,anomalies,causalEdges},log);
 
 app.listen({port:Number(process.env.PORT||6301),host:'127.0.0.1'}).catch(err=>{app.log.error(err);process.exit(1)});

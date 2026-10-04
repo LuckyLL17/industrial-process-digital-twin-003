@@ -28,3 +28,16 @@ npm run dev
 - 综合过程健康评分
 
 扩展接口：`/api/recipes`、`/api/control/commands`、`/api/maintenance/windows`、`/api/process/health-score`。
+
+## 生产时段复盘（Replay Sessions）
+
+独立于实时状态的会话式回放，用于复盘已结束的生产时段。会话创建时对 telemetry、设备、anomaly 和因果图做**深拷贝快照**，执行只基于该快照，不会读写或修改任何实时数据；之后新入库的点、异常处置或图谱变更都不会渗入历史复盘。
+
+- `POST /api/replay/sessions`：按 `assetId`、`rootId`、`from`、`to`（ISO 8601）创建会话，立即返回 `preflight` 预检问题，初始状态 `pending`。
+- `POST /api/replay/sessions/:id/run`：执行回放。成功结果只计算一次，重复执行返回缓存（`reused:true`），`resultHash` 与 `executedAt` 稳定。
+- `GET /api/replay/sessions`：列表，支持 `status`/`assetId`/`rootId` 过滤。
+- `GET /api/replay/sessions/:id`：会话详情（含快照规模摘要）。
+- `GET /api/replay/sessions/:id/result`：查询结果——按时间排序的输入快照、设备状态轨迹与冻结基线、逐点约束校验，以及关联快照异常与冻结因果边的根因证据；未执行返回 409，无效终止返回 422。
+
+会话状态：`pending`（未执行）、`success`（成功）、`invalid`（无效终止，携带可解释的 `invalidReason`）。无效终止错误码：`BAD_TIMESTAMP`（坏时间戳）、`WINDOW_REVERSED`（窗口倒置）、`EMPTY_WINDOW`（窗口内无该资产测点）、`ASSET_NOT_FOUND`、`INVALID_ROOT_NODE`（根节点既不是资产也不在因果图中）。
+
